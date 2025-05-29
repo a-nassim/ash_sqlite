@@ -198,8 +198,19 @@ defmodule AshSqlite.SqlImplementation do
   end
 
   @impl true
-  def repo(resource, _kind) do
-    AshSqlite.DataLayer.Info.repo(resource)
+  def repo(resource, kind) do
+    write_repo = AshSqlite.DataLayer.Info.repo(resource)
+
+    cond do
+      write_repo.in_transaction?() ->
+        write_repo
+
+      kind == :mutate ->
+        write_repo
+
+      true ->
+        Module.concat(write_repo, Read)
+    end
   end
 
   @impl true
