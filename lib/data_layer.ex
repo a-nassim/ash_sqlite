@@ -409,11 +409,36 @@ defmodule AshSqlite.DataLayer do
   import Ecto.Query, only: [from: 2]
 
   @impl true
+  def in_transaction?(resource) do
+    AshSqlite.DataLayer.Info.repo(resource).in_transaction?()
+  end
+
+  @impl true
+  def transaction(resource, func, _timeout \\ nil, reason \\ %{type: :custom, metadata: %{}}) do
+    repo =
+      case reason[:data_layer_context] do
+        %{repo: repo} when not is_nil(repo) ->
+          repo
+
+        _ ->
+          AshSqlite.DataLayer.Info.repo(resource)
+      end
+
+    func = fn ->
+      repo.on_transaction_begin(reason)
+
+      func.()
+    end
+
+    repo.transaction(func)
+  end
+
+  @impl true
   def can?(_, :async_engine), do: false
   def can?(_, :bulk_create), do: true
   def can?(_, {:lock, _}), do: false
 
-  def can?(_, :transact), do: false
+  def can?(_, :transact), do: true
   def can?(_, :composite_primary_key), do: true
   def can?(_, {:atomic, :update}), do: true
   def can?(_, {:atomic, :upsert}), do: true

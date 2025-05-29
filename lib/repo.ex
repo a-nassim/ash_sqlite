@@ -56,9 +56,45 @@ defmodule AshSqlite.Repo do
           |> Keyword.put(:installed_extensions, installed_extensions())
           |> Keyword.put(:migrations_path, migrations_path())
           |> Keyword.put(:case_sensitive_like, :on)
+          # Try to acquire the write lock immediately when starting a transaction
+          |> Keyword.put_new(:default_transaction_mode, :immediate)
+          # SQLite has a built-in mechanism to handle queuing
+          # Disabling it to retry more aggressively
+          |> Keyword.put_new(:busy_timeout, 0)
 
         {:ok, new_config}
       end
+
+      defoverridable transaction: 1, transaction: 2
+
+      def transaction(fun, opts \\ []) do
+        do_transaction(fn -> super(fun, opts) end)
+      end
+
+      defp do_transaction(fun, start \\ System.monotonic_time()) do
+        if System.convert_time_unit(System.monotonic_time() - start, :native, :second) < 5 do
+          fun.()
+        else
+          {:error, :database_locked}
+        end
+      catch
+        :error, %Exqlite.Error{message: "database is locked"} ->
+          to_timeout(millisecond: 1)
+          |> Process.sleep()
+
+          do_transaction(fun, start)
+      end
+
+      def transaction!(fun) do
+        case fun.() do
+          {:ok, value} -> value
+          {:error, error} -> raise Ash.Error.to_error_class(error)
+        end
+      end
+
+      def on_transaction_begin(_reason), do: :ok
+
+      defoverridable on_transaction_begin: 1
 
       def insert(struct_or_changeset, opts \\ []) do
         struct_or_changeset
