@@ -60,6 +60,10 @@ defmodule AshSqlite.Repo do
         {:ok, new_config}
       end
 
+      def on_transaction_begin(_reason), do: :ok
+
+      defoverridable on_transaction_begin: 1
+
       def insert(struct_or_changeset, opts \\ []) do
         struct_or_changeset
         |> to_ecto()
