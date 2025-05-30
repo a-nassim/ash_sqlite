@@ -194,10 +194,10 @@ defmodule AshSqlite.DataLayer do
     ],
     schema: [
       repo: [
-        type: :atom,
+        type: {:or, [{:behaviour, Ecto.Repo}, {:fun, 2}]},
         required: true,
         doc:
-          "The repo that will be used to fetch your data. See the `AshSqlite.Repo` documentation for more"
+          "The repo that will be used to fetch your data. See the `AshSqlite.Repo` documentation for more. Can also be a function that takes a resource and a type `:read | :mutate` and returns the repo"
       ],
       migrate?: [
         type: :boolean,
@@ -301,7 +301,6 @@ defmodule AshSqlite.DataLayer do
     sections: @sections,
     transformers: [
       AshSqlite.Transformers.ValidateReferences,
-      AshSqlite.Transformers.VerifyRepo,
       AshSqlite.Transformers.EnsureTableOrPolymorphic
     ]
 
@@ -416,13 +415,40 @@ defmodule AshSqlite.DataLayer do
   import Ecto.Query, only: [from: 2]
 
   @impl true
+  def in_transaction?(resource) do
+    AshSqlite.DataLayer.Info.repo(resource).in_transaction?()
+  end
+
+  @impl true
+  def transaction(resource, func, timeout \\ nil, reason \\ %{type: :custom, metadata: %{}}) do
+    repo =
+      case reason[:data_layer_context] do
+        %{repo: repo} when not is_nil(repo) ->
+          repo
+
+        _ ->
+          AshSqlite.DataLayer.Info.repo(resource)
+      end
+
+    func = fn ->
+      repo.on_transaction_begin(reason)
+
+      func.()
+    end
+
+    repo.transaction(func, timeout: timeout || :infinity)
+  end
+
+  @impl true
   def can?(_, :async_engine), do: false
   def can?(_, :bulk_create), do: true
   def can?(_, :update_query), do: true
   def can?(_, :destroy_query), do: true
   def can?(_, {:lock, _}), do: false
 
-  def can?(_, :transact), do: false
+  def can?(resource, :transact),
+    do: AshSqlite.DataLayer.Info.repo(resource).config()[:enable_transactions?] || false
+
   def can?(_, :composite_primary_key), do: true
   def can?(_, {:atomic, :update}), do: true
   def can?(_, {:atomic, :upsert}), do: true
@@ -616,7 +642,7 @@ defmodule AshSqlite.DataLayer do
     stream
     |> Enum.group_by(&Map.keys(&1.attributes))
     |> Enum.reduce_while({:ok, []}, fn {_, changesets}, {:ok, acc} ->
-      repo = AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, Enum.at(changesets, 0))
+      repo = dynamic_repo(resource, Enum.at(changesets, 0))
       opts = AshSql.repo_opts(repo, AshSqlite.SqlImplementation, nil, options[:tenant], resource)
 
       opts =
@@ -1991,16 +2017,8 @@ defmodule AshSqlite.DataLayer do
     end
   end
 
-  defp dynamic_repo(resource, %{__ash_bindings__: %{context: %{data_layer: %{repo: repo}}}}) do
-    repo || AshSqlite.DataLayer.Info.repo(resource)
-  end
-
-  defp dynamic_repo(resource, %{context: %{data_layer: %{repo: repo}}}) do
-    repo || AshSqlite.DataLayer.Info.repo(resource)
-  end
-
-  defp dynamic_repo(resource, _) do
-    AshSqlite.DataLayer.Info.repo(resource)
+  defp dynamic_repo(resource, query_or_changeset) do
+    AshSql.dynamic_repo(resource, AshSqlite.SqlImplementation, query_or_changeset)
   end
 
   defp resolve_source(resource, changeset) do
