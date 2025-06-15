@@ -1460,7 +1460,7 @@ defmodule AshSqlite.DataLayer do
               {:error,
                Ash.Error.Changes.StaleRecord.exception(
                  resource: resource,
-                 filters: changeset.filter
+                 filter: changeset.filter
                )}
 
             {1, [result]} ->
