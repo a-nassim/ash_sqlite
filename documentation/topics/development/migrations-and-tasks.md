@@ -130,9 +130,11 @@ The `default:` of an attribute (a number, string, boolean, atom, decimal, date o
 
 Snapshots keep the defaults, so a run without the option after one with it sees them as removed. If you use rebuilds, set `rebuild_tables: true` in the repo's config instead of passing the flag, so that every run agrees, `mix ash.codegen --check` in CI included.
 
-### Renamed resources
+### Renamed and removed resources
 
-When a resource's table changes, the generator asks whether the table that has no resource any more was renamed (`Are you renaming owners to people?`). The migration is then `rename table(:owners), to: table(:people)`, and the tables that point to it follow. Nothing is asked with `--dev` (the final run asks), `--check` or `--domains`, and a resource with `migrate?(false)` keeps its table.
+When a resource's table changes, or a resource is removed, the generator asks whether the table that has no resource any more was renamed (`Are you renaming owners to people?`) or is to be dropped (`Table owners no longer has a resource. Generate a migration to DROP this table?`). A rename is `rename table(:owners), to: table(:people)`, and the tables that point to it follow. A drop warns that the rows are gone for good, and rolling it back creates the table again, empty; answering no is remembered. Nothing is asked with `--dev` (the final run asks), `--check` or `--domains`, and a resource with `migrate?(false)` keeps its table.
+
+A migration that drops tables switches foreign keys off and checks them before it commits, like a rebuild: a table that still points to a dropped one (one the resources do not know of, for example) stops the migration instead of losing its rows. If foreign keys are still on when it runs, because the callbacks did not, it refuses to drop.
 
 ### Regenerating Migrations
 

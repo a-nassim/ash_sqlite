@@ -31,6 +31,20 @@ defmodule AshSqlite.MigrationGenerator.Phase do
     end
   end
 
+  defmodule Drop do
+    @moduledoc false
+    # `recreate` is the code that creates the table again, for `down`.
+    defstruct [:table, :recreate, commented?: false]
+
+    import AshSqlite.MigrationGenerator.Operation.Helper, only: [as_atom: 1]
+
+    def up(%{table: table}), do: "drop_table :#{as_atom(table)}"
+
+    def down(%{recreate: recreate}) do
+      "# the table comes back empty: its rows are lost\n" <> recreate
+    end
+  end
+
   defmodule Alter do
     @moduledoc false
     defstruct [:table, :multitenancy, operations: [], commented?: false]

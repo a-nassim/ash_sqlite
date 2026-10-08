@@ -61,11 +61,10 @@ defmodule Mix.Tasks.AshSqlite.GenerateMigrations do
   date or time) then also becomes the default of its column. Set `rebuild_tables: true` in the
   repo's config rather than passing the flag, so that every run agrees. See the "Migrations" guide.
 
-  #### Renamed resources
+  #### Renamed and removed resources
 
-  The generator asks whether a table that has a snapshot but no resource any more was renamed, and
-  writes `rename table(:old), to: table(:new)`. The tables that point to it follow. See the
-  "Migrations" guide.
+  The generator asks whether a table that has a snapshot but no resource any more was renamed or is
+  to be dropped, and writes a `rename` or a `drop`. See the "Migrations" guide.
 
   #### Conflicts/Multiple Resources
 

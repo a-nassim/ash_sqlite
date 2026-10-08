@@ -331,13 +331,19 @@ defmodule AshSqlite.MigrationGenerator do
   end
 
   defp create_migrations(snapshots, unmanaged_tables, opts) do
-    snapshots
-    |> Enum.group_by(& &1.repo)
-    |> Enum.flat_map(fn {repo, snapshots} ->
+    snapshots_by_repo = Enum.group_by(snapshots, & &1.repo)
+
+    # A repo whose resources have all been removed has no snapshots to find it by, but
+    # its tables are still to be dropped: the repos of the project are looked at too.
+    (Map.keys(snapshots_by_repo) ++ configured_repos())
+    |> Enum.uniq()
+    |> Enum.flat_map(fn repo ->
+      snapshots = Map.get(snapshots_by_repo, repo, [])
+
       managed_tables = snapshots |> Enum.map(& &1.table) |> Enum.uniq()
       unmanaged_tables = for {^repo, table} <- unmanaged_tables, do: table
 
-      renames = renamed_tables(repo, managed_tables, unmanaged_tables, opts)
+      {renames, drops} = orphan_tables(repo, managed_tables, unmanaged_tables, opts)
       deduped = deduplicate_snapshots(snapshots, opts, [], renames)
 
       snapshots_with_operations =
@@ -361,11 +367,13 @@ defmodule AshSqlite.MigrationGenerator do
         for {new_table, old_snapshot} <- renames,
             do: %Operation.RenameTable{old_table: old_snapshot.table, table: new_table}
 
+      drop_phases = drop_phases(drops, opts)
+
       snapshots_with_operations
       |> Enum.flat_map(&elem(&1, 1))
       |> Enum.uniq()
       |> case do
-        [] when rename_operations == [] ->
+        [] when rename_operations == [] and drop_phases == [] ->
           []
 
         operations ->
@@ -389,7 +397,7 @@ defmodule AshSqlite.MigrationGenerator do
           end
 
           # a table has its new name before anything is done to it
-          phases = rename_operations ++ organize_operations(operations)
+          phases = rename_operations ++ organize_operations(operations) ++ drop_phases
 
           migration_files =
             phases
@@ -397,7 +405,14 @@ defmodule AshSqlite.MigrationGenerator do
             |> migration(repo, rebuilds?(phases), opts)
 
           snapshot_files = create_new_snapshot(snapshots, repo_name(repo), opts)
-          remove_orphan_snapshots(Map.values(renames), repo, opts)
+          remove_orphan_snapshots(Map.values(renames) ++ drops, repo, opts)
+
+          if drops != [] and !opts.quiet do
+            warn(
+              "Warning: this migration drops #{Enum.map_join(drops, ", ", & &1.table)}. " <>
+                "Their rows are gone for good: rolling it back creates the tables again, empty."
+            )
+          end
 
           [migration_files] ++ snapshot_files
       end
@@ -411,33 +426,108 @@ defmodule AshSqlite.MigrationGenerator do
       end)
   end
 
-  # The tables that were renamed, `%{new_table => the old table's snapshot}`: a table with a
-  # snapshot and no resource, and a table without a snapshot, that the user says are the same.
-  # Not asked with --dev (the final run does), --check or --domains (the tables of the domains
-  # left out would look removed).
-  defp renamed_tables(repo, managed_tables, unmanaged_tables, opts) do
+  defp configured_repos do
+    Mix.Project.config()[:app]
+    |> Application.get_env(:ecto_repos, [])
+    |> Enum.filter(&Spark.implements_behaviour?(&1, AshSqlite.Repo))
+  end
+
+  # The tables with a snapshot and no resource: `{renames, drops}`, the first
+  # `%{new_table => the old table's snapshot}`, the second the snapshots of the tables to
+  # drop. It asks which were renamed and which to drop (not one it was told not to drop before),
+  # except with --dev (the final run does), --check or --domains (the tables of the domains left
+  # out would look removed).
+  defp orphan_tables(repo, managed_tables, unmanaged_tables, opts) do
     if opts.dev or opts.check or !opts.orphan_tables do
-      %{}
+      {%{}, []}
     else
       on_disk = snapshot_tables(repo, opts)
       added = managed_tables -- on_disk
 
-      on_disk
-      |> Enum.reject(&(&1 in managed_tables or &1 in unmanaged_tables))
-      |> Enum.sort()
-      |> Enum.reduce(%{}, fn old_table, renames ->
-        candidates = added -- Map.keys(renames)
+      {renames, drops} =
+        on_disk
+        |> Enum.reject(&(&1 in managed_tables or &1 in unmanaged_tables))
+        |> Enum.sort()
+        |> Enum.reduce({%{}, []}, fn old_table, {renames, drops} = acc ->
+          old_snapshot = get_existing_snapshot(%{repo: repo, table: old_table}, opts)
 
-        with [_ | _] <- candidates,
-             %{} = old_snapshot <- get_existing_snapshot(%{repo: repo, table: old_table}, opts),
-             new_table when not is_nil(new_table) <- renamed_to(old_table, candidates) do
-          Map.put(renames, new_table, old_snapshot)
-        else
-          _ -> renames
-        end
-      end)
+          cond do
+            is_nil(old_snapshot) or Map.get(old_snapshot, :drop_table_opted_out, false) ->
+              acc
+
+            new_table = renamed_to(old_table, added -- Map.keys(renames)) ->
+              {Map.put(renames, new_table, old_snapshot), drops}
+
+            drop?(old_snapshot, repo, opts) ->
+              {renames, [old_snapshot | drops]}
+
+            true ->
+              acc
+          end
+        end)
+
+      {renames, Enum.reverse(drops)}
     end
   end
+
+  defp drop?(snapshot, repo, opts) do
+    answer =
+      Mix.shell().yes?(
+        "Table #{snapshot.table} no longer has a resource. Generate a migration to DROP " <>
+          "this table? This will permanently remove the table and its data.",
+        default: :no
+      )
+
+    unless answer, do: remember_not_to_drop(snapshot, repo, opts)
+
+    answer
+  end
+
+  # In the table's latest snapshot, so that it is not asked about every time.
+  defp remember_not_to_drop(snapshot, repo, opts) do
+    folder =
+      opts
+      |> snapshot_path(repo)
+      |> Path.join(repo_name(repo))
+      |> Path.join(snapshot.table)
+
+    with false <- opts.dry_run,
+         {:ok, files} <- File.ls(folder),
+         [_ | _] = files <- Enum.filter(files, &String.match?(&1, ~r/^\d{14}\.json$/)) do
+      path = Path.join(folder, Enum.max(files))
+
+      File.write!(
+        path,
+        path
+        |> File.read!()
+        |> Jason.decode!()
+        |> Map.put("drop_table_opted_out", true)
+        |> Jason.encode!(pretty: true)
+      )
+    end
+
+    :ok
+  end
+
+  # The order does not matter: foreign keys are off while the migration runs.
+  defp drop_phases(drops, opts) do
+    Enum.map(drops, fn snapshot ->
+      %Phase.Drop{table: snapshot.table, recreate: recreate_table(snapshot, opts)}
+    end)
+  end
+
+  # What `down` runs: the table as its snapshot has it, as if it were a new one.
+  defp recreate_table(snapshot, opts) do
+    {_, operations} =
+      add_order_to_operations({snapshot, do_fetch_operations(snapshot, nil, opts)})
+
+    operations
+    |> organize_operations()
+    |> build_up_and_down()
+    |> elem(0)
+  end
+
+  defp renamed_to(_old_table, []), do: nil
 
   defp renamed_to(old_table, [new_table]) do
     if Mix.shell().yes?("Are you renaming #{old_table} to #{new_table}?"), do: new_table
@@ -1095,7 +1185,10 @@ defmodule AshSqlite.MigrationGenerator do
     {up, down}
   end
 
-  defp rebuilds?(phases), do: Enum.any?(phases, &match?(%Operation.RebuildTable{}, &1))
+  # A rebuild and a drop both delete from the table first, which with foreign keys on runs the
+  # `ON DELETE` actions of the tables that point to it: those migrations switch them off.
+  defp rebuilds?(phases),
+    do: Enum.any?(phases, &(match?(%Operation.RebuildTable{}, &1) or match?(%Phase.Drop{}, &1)))
 
   defp maybe_comment(text, %{commented?: true}) do
     text

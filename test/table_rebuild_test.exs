@@ -1324,7 +1324,7 @@ defmodule AshSqlite.TableRebuildTest do
       migration = last_migration(ctx)
       assert migration =~ "rename table(:owners), to: table(:people)"
       refute migration =~ "create table"
-      refute migration =~ "drop table"
+      refute migration =~ "drop_table"
 
       migrate(ctx)
       assert sql("SELECT id, name FROM people") == [["a", "x"]]
@@ -1500,11 +1500,133 @@ defmodule AshSqlite.TableRebuildTest do
 
       migration = last_migration(ctx)
       assert migration =~ "rename table(:owners), to: table(:people)"
-      refute migration =~ "drop table"
+      refute migration =~ "drop_table"
       refute migration =~ "create table"
 
       migrate(ctx)
       assert sql("SELECT id, name FROM people") == [["a", "x"]]
+    end
+  end
+
+  describe "dropping a table" do
+    defmacrop parent_and_child do
+      quote do
+        defres Parent, "parents" do
+          attributes do
+            uuid_primary_key(:id)
+            attribute(:name, :string)
+          end
+
+          identities do
+            identity(:unique_name, [:name])
+          end
+        end
+
+        defres Child, "pets" do
+          attributes do
+            uuid_primary_key(:id)
+          end
+
+          relationships do
+            belongs_to(:parent, Parent)
+          end
+        end
+
+        defres Keep, "keeps" do
+          attributes do
+            uuid_primary_key(:id)
+          end
+        end
+      end
+    end
+
+    defp parents_removed(ctx) do
+      parent_and_child()
+      defdomain([Parent, Child, Keep])
+      generate(Domain, ctx)
+      migrate(ctx)
+      sql("INSERT INTO parents (id, name) VALUES ('p', 'x')")
+      sql("INSERT INTO pets (id, parent_id) VALUES ('c', 'p')")
+
+      defdomain([Keep])
+
+      # the alias made by `defdomain` only lives in this function
+      Domain
+    end
+
+    test "when its resource is gone and the answer is yes", %{ctx: ctx} do
+      domain = parents_removed(ctx)
+      send(self(), {:mix_shell_input, :yes?, true})
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(domain, ctx, quiet: false)
+
+      [up, down] = String.split(last_migration(ctx), "def down do")
+      assert up =~ "drop_table :pets"
+      assert up =~ "drop_table :parents"
+
+      # the other tables are left alone, and rolling it back brings the tables back, empty
+      refute up =~ "keeps"
+      assert down =~ "the table comes back empty"
+      assert down =~ "create table(:parents"
+      assert down =~ "create table(:pets"
+      assert down =~ ~S|create unique_index(:parents, [:name], name: "parents_unique_name_index")|
+
+      assert_received {:mix_shell, :info, ["Warning: this migration drops parents, pets." <> _]}
+
+      migrate(ctx)
+      assert table_names() == ["keeps", "schema_migrations"]
+      assert snapshot_tables(ctx) == ["keeps"]
+
+      # nothing is left to ask about
+      generate(domain, ctx)
+      assert length(migrations(ctx)) == 2
+
+      rollback(ctx)
+      assert table_names() == ["keeps", "parents", "pets", "schema_migrations"]
+      assert sql("SELECT id FROM parents") == []
+      assert [[_, _, "parents" | _]] = sql("PRAGMA foreign_key_list(pets)")
+    end
+
+    test "a table the resources do not know that still points at it stops the drop", %{ctx: ctx} do
+      defres Parent, "parents" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defres Keep, "keeps" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defdomain([Parent, Keep])
+      generate(Domain, ctx)
+      migrate(ctx)
+
+      # a table of its own, with a foreign key to the one that is dropped
+      sql("INSERT INTO parents (id) VALUES ('p')")
+
+      sql(
+        "CREATE TABLE notes (id TEXT PRIMARY KEY, parent_id TEXT REFERENCES parents(id) ON DELETE CASCADE)"
+      )
+
+      sql("INSERT INTO notes (id, parent_id) VALUES ('n', 'p')")
+      versions_before = versions()
+
+      defdomain([Keep])
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+      assert last_migration(ctx) =~ "use AshSqlite.Migration"
+
+      # without the migration switching foreign keys off, the drop would delete the note
+      error = migrate_error(ctx)
+      assert error =~ "foreign key check failed"
+      assert error =~ "notes"
+
+      assert sql("SELECT id, parent_id FROM notes") == [["n", "p"]]
+      assert sql("SELECT id FROM parents") == [["p"]]
+      assert versions() == versions_before
     end
   end
 end

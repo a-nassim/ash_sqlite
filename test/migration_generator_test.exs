@@ -2134,6 +2134,32 @@ defmodule AshSqlite.MigrationGeneratorTest do
       end
     end
 
+    defmacrop defparent_and_keep do
+      quote do
+        defresource Parent, "parents" do
+          attributes do
+            uuid_primary_key(:id)
+          end
+        end
+
+        defresource Child, "pets" do
+          attributes do
+            uuid_primary_key(:id)
+          end
+
+          relationships do
+            belongs_to(:parent, Parent)
+          end
+        end
+
+        defresource Keep, "keeps" do
+          attributes do
+            uuid_primary_key(:id)
+          end
+        end
+      end
+    end
+
     defp snapshot_tables(ctx) do
       ctx.snapshot_path |> Path.join("test_repo") |> File.ls!() |> Enum.sort()
     end
@@ -2152,7 +2178,7 @@ defmodule AshSqlite.MigrationGeneratorTest do
       [up, _down] = String.split(last_migration(ctx), "def down do")
       assert up =~ "create table(:people"
       refute up =~ "rename table"
-      refute up =~ "drop table"
+      refute up =~ "drop_table"
       assert snapshot_tables(ctx) == ["owners", "people"]
     end
 
@@ -2202,6 +2228,56 @@ defmodule AshSqlite.MigrationGeneratorTest do
 
       refute_received {:mix_shell, :yes?, _}
       assert last_migration(ctx) =~ "create table(:others"
+    end
+
+    test "a drop that is declined is not done, and it is not asked again", ctx do
+      defparent_and_keep()
+      defdomain([Parent, Child, Keep])
+      generate(Domain, ctx)
+
+      defdomain([Keep])
+      send(self(), {:mix_shell_input, :yes?, false})
+      send(self(), {:mix_shell_input, :yes?, false})
+      generate(Domain, ctx)
+
+      assert length(migrations(ctx)) == 1
+
+      # no answers given: asking again would raise
+      generate(Domain, ctx)
+      assert length(migrations(ctx)) == 1
+      assert snapshot_tables(ctx) == ["keeps", "parents", "pets"]
+    end
+
+    test "when every resource of the repo is gone, they are all offered", ctx do
+      defparent_and_keep()
+      defdomain([Parent, Child, Keep])
+      generate(Domain, ctx)
+
+      defdomain([])
+      send(self(), {:mix_shell_input, :yes?, true})
+      send(self(), {:mix_shell_input, :yes?, true})
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+
+      [up, _down] = String.split(last_migration(ctx), "def down do")
+      assert up =~ "drop_table :keeps"
+      assert up =~ "drop_table :parents"
+      assert up =~ "drop_table :pets"
+    end
+
+    test "nothing is asked about with --dev, --check, or domains chosen by hand", ctx do
+      defparent_and_keep()
+      defdomain([Parent, Child, Keep])
+      generate(Domain, ctx)
+
+      defdomain([Keep])
+      generate(Domain, ctx, dev: true)
+      generate(Domain, ctx, check: true)
+      generate(Domain, ctx, orphan_tables: false)
+
+      assert length(migrations(ctx)) == 1
+      assert snapshot_tables(ctx) == ["keeps", "parents", "pets"]
+      refute_received {:mix_shell, :yes?, _}
     end
   end
 end

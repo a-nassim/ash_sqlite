@@ -184,6 +184,25 @@ defmodule AshSqlite.MigrationTest do
     assert leftovers() == []
   end
 
+  test "a drop refuses when foreign keys are on, rather than empty the tables that point to it",
+       %{
+         ctx: ctx
+       } do
+    blog(ctx)
+
+    write_migration(ctx, 2, "drop_posts", """
+    @disable_ddl_transaction true
+
+    def up, do: drop_table(:posts)
+
+    def down, do: :ok
+    """)
+
+    assert migrate_error(ctx) =~ "refusing to drop posts: foreign keys are on"
+    assert sql("SELECT id FROM comments") == [["c"]]
+    assert sql("SELECT id FROM posts") == [["p"]]
+  end
+
   test "a migration without a transaction refuses, rather than drop with foreign keys on", %{
     ctx: ctx
   } do

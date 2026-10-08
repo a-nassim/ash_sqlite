@@ -31,7 +31,7 @@ defmodule AshSqlite.Migration do
   defmacro __using__(_opts) do
     quote do
       use Ecto.Migration
-      import AshSqlite.Migration, only: [rebuild_table: 2, rebuild_table: 3]
+      import AshSqlite.Migration, only: [rebuild_table: 2, rebuild_table: 3, drop_table: 1]
 
       defdelegate before_transaction(repo), to: AshSqlite.Migration, as: :__before_transaction__
       defdelegate after_transaction(repo), to: AshSqlite.Migration, as: :__after_transaction__
@@ -61,17 +61,29 @@ defmodule AshSqlite.Migration do
     end
   end
 
-  # Ecto does not run the callbacks for a migration without a transaction
-  # (`@disable_ddl_transaction true`), and dropping a table with foreign keys on deletes
-  # from the tables that reference it. So `rebuild_table/3` checks first that they are off.
+  # The callbacks may not run (a migration without a transaction, `@disable_ddl_transaction true`,
+  # or an Ecto that does not have them), and dropping a table with foreign keys on deletes
+  # from the tables that reference it. So `rebuild_table/3` and `drop_table/1` check first
+  # that they are off.
   @doc false
-  def __check_foreign_keys_off__(repo, table) do
+  def __check_foreign_keys_off__(repo, table, action) do
     if pragma(repo, "foreign_keys") != 0 do
-      raise "refusing to rebuild #{table}: foreign keys are on, so dropping it would run " <>
-              "the ON DELETE actions of the tables that reference it. They are switched " <>
-              "off by the callbacks `use AshSqlite.Migration` adds, which Ecto only runs " <>
-              "when the migration runs in its own transaction: remove " <>
-              "`@disable_ddl_transaction true`."
+      raise "refusing to #{action} #{table}: foreign keys are on, so dropping it would run " <>
+              "the ON DELETE actions of the tables that reference it. `use AshSqlite.Migration` " <>
+              "switches them off with Ecto callbacks that did not run: either the migration " <>
+              "has `@disable_ddl_transaction true` (remove it) or Ecto does not have them."
+    end
+  end
+
+  @doc """
+  Drops `table`, after checking that foreign keys are off, so that the tables that point to it
+  keep their rows. Written by the migration generator when a resource is removed.
+  """
+  defmacro drop_table(table) do
+    quote do
+      table = unquote(table)
+      execute(fn -> AshSqlite.Migration.__check_foreign_keys_off__(repo(), table, "drop") end)
+      drop(table(table))
     end
   end
 
@@ -101,7 +113,7 @@ defmodule AshSqlite.Migration do
       {copy, opts} = Keyword.pop(unquote(opts), :copy, [])
       temporary = "#{table}_rebuild"
 
-      execute(fn -> AshSqlite.Migration.__check_foreign_keys_off__(repo(), table) end)
+      execute(fn -> AshSqlite.Migration.__check_foreign_keys_off__(repo(), table, "rebuild") end)
 
       create table(temporary, [primary_key: false] ++ opts) do
         unquote(block)
@@ -211,7 +223,7 @@ defmodule AshSqlite.Migration do
         :ok
 
       %{rows: rows} ->
-        raise "foreign key check failed after rebuilding tables (table, rowid, parent, constraint): " <>
+        raise "foreign key check failed after the migration changed tables (table, rowid, parent, constraint): " <>
                 inspect(rows)
     end
   end
