@@ -1288,4 +1288,223 @@ defmodule AshSqlite.TableRebuildTest do
       assert sql("SELECT id, count FROM items") == [["a", 1]]
     end
   end
+
+  describe "renaming a table" do
+    defmacrop owners(table) do
+      quote do
+        defres Owner, unquote(table) do
+          attributes do
+            uuid_primary_key(:id)
+            attribute(:name, :string)
+          end
+
+          identities do
+            identity(:unique_name, [:name])
+          end
+        end
+      end
+    end
+
+    defp snapshot_tables(ctx) do
+      ctx.snapshot_path |> Path.join("rebuild_test_repo") |> File.ls!() |> Enum.sort()
+    end
+
+    test "is a rename of the table: the rows stay, so do the indexes", %{ctx: ctx} do
+      owners("owners")
+      defdomain([Owner])
+      generate(Domain, ctx)
+      migrate(ctx)
+      sql("INSERT INTO owners (id, name) VALUES ('a', 'x')")
+
+      owners("people")
+      defdomain([Owner])
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+
+      migration = last_migration(ctx)
+      assert migration =~ "rename table(:owners), to: table(:people)"
+      refute migration =~ "create table"
+      refute migration =~ "drop table"
+
+      migrate(ctx)
+      assert sql("SELECT id, name FROM people") == [["a", "x"]]
+      assert table_names() == ["people", "schema_migrations"]
+
+      # its snapshot moved with it, and there is nothing left to do
+      assert snapshot_tables(ctx) == ["people"]
+      generate(Domain, ctx)
+      assert length(migrations(ctx)) == 2
+    end
+
+    test "a table that points to it follows, with nothing for it to do", %{ctx: ctx} do
+      defres Owner, "owners" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defres Pet, "pets" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+
+        relationships do
+          belongs_to(:owner, Owner)
+        end
+      end
+
+      defdomain([Owner, Pet])
+      generate(Domain, ctx)
+      migrate(ctx)
+      sql("INSERT INTO owners (id) VALUES ('o')")
+      sql("INSERT INTO pets (id, owner_id) VALUES ('p', 'o')")
+
+      defres Owner, "people" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defdomain([Owner, Pet])
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+
+      migration = last_migration(ctx)
+      assert migration =~ "rename table(:owners), to: table(:people)"
+      refute migration =~ "pets"
+      refute migration =~ "rebuild_table"
+
+      migrate(ctx)
+      assert [[_, _, "people" | _]] = sql("PRAGMA foreign_key_list(pets)")
+      assert sql("SELECT id, owner_id FROM pets") == [["p", "o"]]
+      assert fk_violations() == []
+
+      # its snapshot follows too, so there is nothing left to do
+      generate(Domain, ctx)
+      assert length(migrations(ctx)) == 2
+    end
+
+    test "a foreign key of its own is not a change: its name has the table's in it", %{ctx: ctx} do
+      defres Owner, "owners" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defres Pet, "pets" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+
+        relationships do
+          belongs_to(:owner, Owner)
+        end
+      end
+
+      defdomain([Owner, Pet])
+      generate(Domain, ctx)
+      migrate(ctx)
+      sql("INSERT INTO owners (id) VALUES ('o')")
+      sql("INSERT INTO pets (id, owner_id) VALUES ('p', 'o')")
+
+      defres Pet, "animals" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+
+        relationships do
+          belongs_to(:owner, Owner)
+        end
+      end
+
+      defdomain([Owner, Pet])
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+
+      migration = last_migration(ctx)
+      assert migration =~ "rename table(:pets), to: table(:animals)"
+      refute migration =~ "fkey"
+      refute migration =~ "rebuild_table"
+
+      migrate(ctx)
+      assert sql("SELECT id, owner_id FROM animals") == [["p", "o"]]
+      assert [[_, _, "owners" | _]] = sql("PRAGMA foreign_key_list(animals)")
+
+      # nothing is left to do
+      generate(Domain, ctx)
+      assert length(migrations(ctx)) == 2
+    end
+
+    test "together with a rebuild of the table, what mentions it follows", %{ctx: ctx} do
+      owners("owners")
+
+      defres Pet, "pets" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+
+        relationships do
+          belongs_to(:owner, Owner)
+        end
+      end
+
+      defdomain([Owner, Pet])
+      generate(Domain, ctx)
+      migrate(ctx)
+      sql("INSERT INTO owners (id, name) VALUES ('a', 'x')")
+      sql("INSERT INTO pets (id, owner_id) VALUES ('p', 'a')")
+      sql("CREATE VIEW owner_names AS SELECT name FROM owners")
+
+      defres Owner, "people" do
+        attributes do
+          uuid_primary_key(:id)
+          attribute(:name, :string, allow_nil?: false)
+        end
+
+        identities do
+          identity(:unique_name, [:name])
+        end
+      end
+
+      defdomain([Owner, Pet])
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+
+      [up, _] = String.split(last_migration(ctx), "def down do")
+      [rename, rebuild] = String.split(up, "rebuild_table", parts: 2)
+      assert rename =~ "rename table(:owners), to: table(:people)"
+      assert rebuild =~ ":people"
+
+      migrate(ctx)
+      assert sql("SELECT id, name FROM people") == [["a", "x"]]
+      assert [[_, _, "people" | _]] = sql("PRAGMA foreign_key_list(pets)")
+      assert sql("SELECT name FROM owner_names") == [["x"]]
+    end
+
+    test "that began with --dev is still a rename in the final run, not a drop and a create", %{
+      ctx: ctx
+    } do
+      owners("owners")
+      defdomain([Owner])
+      generate(Domain, ctx)
+      migrate(ctx)
+      sql("INSERT INTO owners (id, name) VALUES ('a', 'x')")
+
+      owners("people")
+      defdomain([Owner])
+      generate(Domain, ctx, dev: true)
+      assert last_migration(ctx) =~ "create table(:people"
+
+      send(self(), {:mix_shell_input, :yes?, true})
+      generate(Domain, ctx)
+
+      migration = last_migration(ctx)
+      assert migration =~ "rename table(:owners), to: table(:people)"
+      refute migration =~ "drop table"
+      refute migration =~ "create table"
+
+      migrate(ctx)
+      assert sql("SELECT id, name FROM people") == [["a", "x"]]
+    end
+  end
 end

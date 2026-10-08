@@ -849,6 +849,19 @@ defmodule AshSqlite.MigrationGenerator.Operation do
     end
   end
 
+  defmodule RenameTable do
+    @moduledoc false
+    defstruct [:old_table, :table, no_phase: true]
+
+    import Helper, only: [as_atom: 1]
+
+    def up(%{old_table: old_table, table: table}),
+      do: "rename table(:#{as_atom(old_table)}), to: table(:#{as_atom(table)})"
+
+    def down(%{old_table: old_table, table: table}),
+      do: "rename table(:#{as_atom(table)}), to: table(:#{as_atom(old_table)})"
+  end
+
   defmodule RebuildTable do
     @moduledoc false
     # The operations of a table when one of them cannot be done in place (`requires_rebuild?/1`):

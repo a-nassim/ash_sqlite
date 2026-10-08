@@ -53,7 +53,8 @@ defmodule AshSqlite.RebuildHelper do
           quiet: true,
           format: false,
           auto_name: true,
-          rebuild_tables: true
+          rebuild_tables: true,
+          orphan_tables: true
         ],
         opts
       )
@@ -136,10 +137,13 @@ defmodule AshSqlite.RebuildHelper do
   def versions,
     do: "SELECT version FROM schema_migrations ORDER BY version" |> sql() |> List.flatten()
 
-  @doc "Tables left over from a rebuild (named `*_rebuild`)."
-  def leftovers do
-    "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '%\\_rebuild' ESCAPE '\\'"
+  @doc "The tables of the database, sorted."
+  def table_names do
+    "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
     |> sql()
     |> List.flatten()
   end
+
+  @doc "Tables left over from a rebuild (named `*_rebuild`)."
+  def leftovers, do: Enum.filter(table_names(), &String.ends_with?(&1, "_rebuild"))
 end

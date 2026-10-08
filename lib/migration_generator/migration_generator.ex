@@ -22,7 +22,8 @@ defmodule AshSqlite.MigrationGenerator do
             dev: false,
             auto_name: false,
             drop_columns: false,
-            rebuild_tables: nil
+            rebuild_tables: nil,
+            orphan_tables: false
 
   def generate(domains, opts \\ []) do
     domains = List.wrap(domains)
@@ -38,6 +39,13 @@ defmodule AshSqlite.MigrationGenerator do
       end)
       |> Enum.flat_map(&get_snapshots(&1, all_resources, opts))
 
+    # tables of resources that do not migrate are not tables whose resource is gone
+    unmanaged_tables =
+      for resource <- all_resources,
+          Ash.DataLayer.data_layer(resource) == AshSqlite.DataLayer,
+          !AshSqlite.DataLayer.Info.migrate?(resource),
+          do: {AshSqlite.DataLayer.Info.repo(resource), AshSqlite.DataLayer.Info.table(resource)}
+
     repos =
       snapshots
       |> Enum.map(& &1.repo)
@@ -47,7 +55,7 @@ defmodule AshSqlite.MigrationGenerator do
       create_extension_migrations(repos, opts)
 
     migration_files =
-      create_migrations(snapshots, opts)
+      create_migrations(snapshots, unmanaged_tables, opts)
 
     files = extension_migration_files ++ migration_files
 
@@ -114,7 +122,7 @@ defmodule AshSqlite.MigrationGenerator do
       |> Enum.map(&sanitize_snapshot/1)
 
     new_snapshots
-    |> deduplicate_snapshots(opts, old_snapshots)
+    |> deduplicate_snapshots(opts, old_snapshots, %{})
     |> fetch_operations(opts)
     |> Enum.flat_map(&elem(&1, 1))
     |> Enum.uniq()
@@ -322,24 +330,42 @@ defmodule AshSqlite.MigrationGenerator do
     |> List.flatten()
   end
 
-  defp create_migrations(snapshots, opts) do
+  defp create_migrations(snapshots, unmanaged_tables, opts) do
     snapshots
     |> Enum.group_by(& &1.repo)
     |> Enum.flat_map(fn {repo, snapshots} ->
-      deduped = deduplicate_snapshots(snapshots, opts)
+      managed_tables = snapshots |> Enum.map(& &1.table) |> Enum.uniq()
+      unmanaged_tables = for {^repo, table} <- unmanaged_tables, do: table
+
+      renames = renamed_tables(repo, managed_tables, unmanaged_tables, opts)
+      deduped = deduplicate_snapshots(snapshots, opts, [], renames)
 
       snapshots_with_operations =
         deduped
         |> fetch_operations(opts)
         |> Enum.map(&add_order_to_operations/1)
 
-      snapshots = Enum.map(snapshots_with_operations, &elem(&1, 0))
+      # a renamed table, and one that points to it, has a new snapshot even when nothing else
+      # changed
+      renamed_without_operations =
+        for {snapshot, _old} <- deduped,
+            renamed_or_pointing_to_renamed?(snapshot, renames),
+            !Enum.any?(snapshots_with_operations, fn {with_operations, _} ->
+              with_operations.table == snapshot.table
+            end),
+            do: snapshot
+
+      snapshots = Enum.map(snapshots_with_operations, &elem(&1, 0)) ++ renamed_without_operations
+
+      rename_operations =
+        for {new_table, old_snapshot} <- renames,
+            do: %Operation.RenameTable{old_table: old_snapshot.table, table: new_table}
 
       snapshots_with_operations
       |> Enum.flat_map(&elem(&1, 1))
       |> Enum.uniq()
       |> case do
-        [] ->
+        [] when rename_operations == [] ->
           []
 
         operations ->
@@ -362,7 +388,8 @@ defmodule AshSqlite.MigrationGenerator do
             end
           end
 
-          phases = organize_operations(operations)
+          # a table has its new name before anything is done to it
+          phases = rename_operations ++ organize_operations(operations)
 
           migration_files =
             phases
@@ -370,10 +397,86 @@ defmodule AshSqlite.MigrationGenerator do
             |> migration(repo, rebuilds?(phases), opts)
 
           snapshot_files = create_new_snapshot(snapshots, repo_name(repo), opts)
+          remove_orphan_snapshots(Map.values(renames), repo, opts)
 
           [migration_files] ++ snapshot_files
       end
     end)
+  end
+
+  defp renamed_or_pointing_to_renamed?(snapshot, renames) do
+    Map.has_key?(renames, snapshot.table) or
+      Enum.any?(snapshot.attributes, fn attribute ->
+        match?(%{table: table} when is_map_key(renames, table), attribute.references)
+      end)
+  end
+
+  # The tables that were renamed, `%{new_table => the old table's snapshot}`: a table with a
+  # snapshot and no resource, and a table without a snapshot, that the user says are the same.
+  # Not asked with --dev (the final run does), --check or --domains (the tables of the domains
+  # left out would look removed).
+  defp renamed_tables(repo, managed_tables, unmanaged_tables, opts) do
+    if opts.dev or opts.check or !opts.orphan_tables do
+      %{}
+    else
+      on_disk = snapshot_tables(repo, opts)
+      added = managed_tables -- on_disk
+
+      on_disk
+      |> Enum.reject(&(&1 in managed_tables or &1 in unmanaged_tables))
+      |> Enum.sort()
+      |> Enum.reduce(%{}, fn old_table, renames ->
+        candidates = added -- Map.keys(renames)
+
+        with [_ | _] <- candidates,
+             %{} = old_snapshot <- get_existing_snapshot(%{repo: repo, table: old_table}, opts),
+             new_table when not is_nil(new_table) <- renamed_to(old_table, candidates) do
+          Map.put(renames, new_table, old_snapshot)
+        else
+          _ -> renames
+        end
+      end)
+    end
+  end
+
+  defp renamed_to(old_table, [new_table]) do
+    if Mix.shell().yes?("Are you renaming #{old_table} to #{new_table}?"), do: new_table
+  end
+
+  defp renamed_to(old_table, candidates) do
+    if Mix.shell().yes?("Are you renaming #{old_table}?") do
+      # the prompt for a renamed attribute asks the same
+      get_new_attribute(Enum.map(candidates, &%{source: &1})).source
+    end
+  end
+
+  # The tables with a snapshot that is not a dev one (as `get_existing_snapshot/2`): one that
+  # only has dev snapshots is new for the final run, so it can be what another was renamed to.
+  defp snapshot_tables(repo, opts) do
+    folder = opts |> snapshot_path(repo) |> Path.join(repo_name(repo))
+
+    case File.ls(folder) do
+      {:ok, names} ->
+        Enum.filter(names, fn name ->
+          path = Path.join(folder, name)
+
+          name != "extensions" and File.dir?(path) and
+            Enum.any?(File.ls!(path), &String.match?(&1, ~r/^\d{14}\.json$/))
+        end)
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  defp remove_orphan_snapshots(snapshots, repo, opts) do
+    unless opts.dry_run or opts.check do
+      folder = opts |> snapshot_path(repo) |> Path.join(repo_name(repo))
+
+      for snapshot <- snapshots, do: File.rm_rf(Path.join(folder, snapshot.table))
+    end
+
+    :ok
   end
 
   defp get_dev_migrations(opts, repo) do
@@ -518,25 +621,34 @@ defmodule AshSqlite.MigrationGenerator do
     end)
   end
 
-  defp deduplicate_snapshots(snapshots, opts, existing_snapshots \\ []) do
+  defp deduplicate_snapshots(snapshots, opts, existing_snapshots, renames) do
     grouped =
       snapshots
       |> Enum.group_by(fn snapshot ->
         snapshot.table
       end)
 
+    # A renamed table is compared with the snapshot of the table it was, under its new name.
+    # SQLite keeps the foreign keys that point to it up to date, so those follow it too.
+    table_names = Map.new(renames, fn {new_table, old} -> {old.table, new_table} end)
+
     old_snapshots =
       Map.new(grouped, fn {key, [snapshot | _]} ->
         old_snapshot =
-          if opts.no_shell? do
-            Enum.find(existing_snapshots, &(&1.table == snapshot.table))
-          else
-            get_existing_snapshot(snapshot, opts)
+          cond do
+            old = renames[snapshot.table] ->
+              rename_foreign_keys(%{old | table: snapshot.table}, old.table, snapshot.table)
+
+            opts.no_shell? ->
+              Enum.find(existing_snapshots, &(&1.table == snapshot.table))
+
+            true ->
+              get_existing_snapshot(snapshot, opts)
           end
 
         {
           key,
-          old_snapshot
+          old_snapshot && follow_renamed_tables(old_snapshot, table_names)
         }
       end)
 
@@ -2152,6 +2264,39 @@ defmodule AshSqlite.MigrationGenerator do
       |> File.read!()
       |> load_snapshot()
     end
+  end
+
+  # The default name of a foreign key has its table's in it ("tickets_representative_id_fkey"),
+  # so those of a renamed table would look changed. SQLite cannot rename a constraint and the
+  # old name does nothing: the snapshot goes by the new one, which a rebuild would give it.
+  defp rename_foreign_keys(snapshot, old_table, new_table) do
+    Map.update!(snapshot, :attributes, fn attributes ->
+      Enum.map(attributes, fn
+        %{source: source, references: %{name: name} = references} = attribute ->
+          if name == "#{old_table}_#{source}_fkey" do
+            %{attribute | references: %{references | name: "#{new_table}_#{source}_fkey"}}
+          else
+            attribute
+          end
+
+        attribute ->
+          attribute
+      end)
+    end)
+  end
+
+  defp follow_renamed_tables(snapshot, table_names) when map_size(table_names) == 0, do: snapshot
+
+  defp follow_renamed_tables(snapshot, table_names) do
+    Map.update!(snapshot, :attributes, fn attributes ->
+      Enum.map(attributes, fn
+        %{references: %{table: table} = references} = attribute ->
+          %{attribute | references: %{references | table: Map.get(table_names, table, table)}}
+
+        attribute ->
+          attribute
+      end)
+    end)
   end
 
   defp resolve_renames(_table, adding, [], _opts), do: {adding, [], []}

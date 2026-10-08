@@ -2122,4 +2122,86 @@ defmodule AshSqlite.MigrationGeneratorTest do
       assert hint =~ "(not in the migration)"
     end
   end
+
+  describe "renaming and dropping tables" do
+    defmacrop defowner(table) do
+      quote do
+        defresource Owner, unquote(table) do
+          attributes do
+            uuid_primary_key(:id)
+          end
+        end
+      end
+    end
+
+    defp snapshot_tables(ctx) do
+      ctx.snapshot_path |> Path.join("test_repo") |> File.ls!() |> Enum.sort()
+    end
+
+    test "a rename that is declined is a new table, and the old one is asked about dropping",
+         ctx do
+      defowner("owners")
+      defdomain([Owner])
+      generate(Domain, ctx)
+
+      defowner("people")
+      send(self(), {:mix_shell_input, :yes?, false})
+      send(self(), {:mix_shell_input, :yes?, false})
+      generate(Domain, ctx)
+
+      [up, _down] = String.split(last_migration(ctx), "def down do")
+      assert up =~ "create table(:people"
+      refute up =~ "rename table"
+      refute up =~ "drop table"
+      assert snapshot_tables(ctx) == ["owners", "people"]
+    end
+
+    test "nothing is asked unless the caller says it has all the domains", ctx do
+      defowner("owners")
+      defdomain([Owner])
+      generate(Domain, ctx)
+
+      defowner("people")
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: ctx.snapshot_path,
+        migration_path: ctx.migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      refute_received {:mix_shell, :yes?, _}
+      assert last_migration(ctx) =~ "create table(:people"
+    end
+
+    test "the table of a resource that does not migrate is not one whose resource is gone",
+         ctx do
+      defowner("owners")
+      defdomain([Owner])
+      generate(Domain, ctx)
+
+      defresource Frozen, "owners" do
+        sqlite do
+          migrate?(false)
+        end
+
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defresource Other, "others" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defdomain([Frozen, Other])
+      generate(Domain, ctx)
+
+      refute_received {:mix_shell, :yes?, _}
+      assert last_migration(ctx) =~ "create table(:others"
+    end
+  end
 end

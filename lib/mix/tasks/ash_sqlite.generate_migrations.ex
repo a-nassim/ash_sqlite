@@ -61,6 +61,12 @@ defmodule Mix.Tasks.AshSqlite.GenerateMigrations do
   date or time) then also becomes the default of its column. Set `rebuild_tables: true` in the
   repo's config rather than passing the flag, so that every run agrees. See the "Migrations" guide.
 
+  #### Renamed resources
+
+  The generator asks whether a table that has a snapshot but no resource any more was renamed, and
+  writes `rename table(:old), to: table(:new)`. The tables that point to it follow. See the
+  "Migrations" guide.
+
   #### Conflicts/Multiple Resources
 
   It will raise on conflicts that it can't resolve, like the same field with different
@@ -150,6 +156,8 @@ defmodule Mix.Tasks.AshSqlite.GenerateMigrations do
       opts
       |> Keyword.put(:format, !opts[:no_format])
       |> Keyword.delete(:no_format)
+      # with --domains only those resources are seen, so the tables of the others look removed
+      |> Keyword.put(:orphan_tables, is_nil(opts[:domains]))
       |> Keyword.put_new(:name, name)
 
     AshSqlite.MigrationGenerator.generate(domains, opts)

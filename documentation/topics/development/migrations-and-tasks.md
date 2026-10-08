@@ -130,6 +130,10 @@ The `default:` of an attribute (a number, string, boolean, atom, decimal, date o
 
 Snapshots keep the defaults, so a run without the option after one with it sees them as removed. If you use rebuilds, set `rebuild_tables: true` in the repo's config instead of passing the flag, so that every run agrees, `mix ash.codegen --check` in CI included.
 
+### Renamed resources
+
+When a resource's table changes, the generator asks whether the table that has no resource any more was renamed (`Are you renaming owners to people?`). The migration is then `rename table(:owners), to: table(:people)`, and the tables that point to it follow. Nothing is asked with `--dev` (the final run asks), `--check` or `--domains`, and a resource with `migrate?(false)` keeps its table.
+
 ### Regenerating Migrations
 
 Often, you will run into a situation where you want to make a slight change to a resource after you've already generated and run migrations. If you are using git and would like to undo those changes, then regenerate the migrations, this script may prove useful:
