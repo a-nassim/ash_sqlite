@@ -736,6 +736,44 @@ defmodule AshSqlite.MigrationGeneratorTest do
                ~S[references(:posts, column: :id, name: "posts_post_id_fkey", type: :uuid)]
     end
 
+    test "a table created with references can be rolled back", %{
+      snapshot_path: snapshot_path,
+      migration_path: migration_path
+    } do
+      defresource Owner, "owners" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+      end
+
+      defresource Pet, "pets" do
+        attributes do
+          uuid_primary_key(:id)
+        end
+
+        relationships do
+          belongs_to(:owner, Owner)
+        end
+      end
+
+      defdomain([Owner, Pet])
+
+      AshSqlite.MigrationGenerator.generate(Domain,
+        snapshot_path: snapshot_path,
+        migration_path: migration_path,
+        quiet: true,
+        format: false,
+        auto_name: true
+      )
+
+      assert [file] = Path.wildcard("#{migration_path}/**/*_migrate_resources*.exs")
+      assert [_, down_code] = String.split(File.read!(file), "def down do")
+
+      # dropping the tables drops their foreign keys: there is nothing to raise about
+      refute down_code =~ "raise"
+      assert down_code =~ "drop table(:pets)"
+    end
+
     test "references are inferred automatically if the attribute has a different type", %{
       snapshot_path: snapshot_path,
       migration_path: migration_path

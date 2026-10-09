@@ -687,10 +687,22 @@ defmodule AshSqlite.MigrationGenerator do
 
   defp organize_operations(operations) do
     operations
+    |> drop_foreign_keys_of_created_tables()
     |> sort_operations()
     |> streamline()
     |> group_into_phases()
     |> clean_phases()
+  end
+
+  # Rolling back a created table drops the table itself, so there is no foreign key to
+  # drop first (SQLite cannot drop one, and the operation would raise).
+  defp drop_foreign_keys_of_created_tables(operations) do
+    created = for %Operation.CreateTable{table: table} <- operations, do: table
+
+    Enum.reject(operations, fn
+      %Operation.DropForeignKey{direction: :down, table: table} -> table in created
+      _ -> false
+    end)
   end
 
   defp clean_phases(phases) do
